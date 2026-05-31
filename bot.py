@@ -41,15 +41,29 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+background_tasks_started = False
+
 # ---- Configuration and environment ----
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-DB_PATH = os.getenv("DB_PATH", "/data/market.db")
+DB_PATH = os.getenv("DB_PATH")
+if not DB_PATH:
+    DB_PATH = "/data/market.db" if os.path.isdir("/data") else "./data/market.db"
+if DB_PATH:
+    db_dir = os.path.dirname(DB_PATH) or "."
+    os.makedirs(db_dir, exist_ok=True)
 ADMIN_CHANNEL_ID           = int(os.getenv("ADMIN_CHANNEL_ID", "0") or 0)
 # Comma-separated Discord user IDs that may run admin commands (set via ADMIN secret)
 ADMIN_IDS                  = {s.strip() for s in os.getenv("ADMIN", "").split(",") if s.strip()}
 _market_ch_raw             = os.getenv("MARKET_CHANNEL_ID", "0") or "0"
-MARKET_CHANNEL_ID          = int(_market_ch_raw.strip().split("/")[-1])
+try:
+    MARKET_CHANNEL_ID = int(_market_ch_raw.strip().split("/")[-1])
+except ValueError:
+    MARKET_CHANNEL_ID = 0
+    logger.warning("MARKET_CHANNEL_ID is invalid: %r", _market_ch_raw)
 WITHDRAWAL_LOG_CHANNEL_ID  = 1510444352294621224   # #withdrawal-log — admin notifications
 ACTIVITY_LOG_CHANNEL_ID    = 1510444499334336743   # #activity-log — all market events
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)   # set for instant slash command sync
@@ -2080,19 +2094,25 @@ else:
             except Exception:
                 logger.exception("Failed to sync slash commands")
             logger.info(f"Bot ready as {bot.user}")
+            logger.info("MARKET_CHANNEL_ID=%s, DB_PATH=%s", MARKET_CHANNEL_ID, DB_PATH)
             # Initialize dividend config and start background tasks
             try:
                 Dividends.init_dividend_config()
             except Exception:
                 logger.exception("Failed to init dividend config")
 
-            bot.loop.create_task(background_ledger_poller())
-            bot.loop.create_task(background_price_drift())
-            bot.loop.create_task(background_day_reset())
-            bot.loop.create_task(background_market_events())
-            bot.loop.create_task(background_dividend_payouts())
-            if MARKET_CHANNEL_ID:
-                bot.loop.create_task(background_market_embed())
+            global background_tasks_started
+            if not background_tasks_started:
+                bot.loop.create_task(background_ledger_poller())
+                bot.loop.create_task(background_price_drift())
+                bot.loop.create_task(background_day_reset())
+                bot.loop.create_task(background_market_events())
+                bot.loop.create_task(background_dividend_payouts())
+                if MARKET_CHANNEL_ID:
+                    bot.loop.create_task(background_market_embed())
+                background_tasks_started = True
+            else:
+                logger.info("Background tasks already started, skipping duplicate startup")
 
     async def background_day_reset():
         """Reset day_start_price to current price at UTC midnight each day."""
@@ -2153,145 +2173,153 @@ async def background_dividend_payouts():
         except Exception:
             logger.exception("Dividend payout failed")
 
-    async def background_price_drift():
-        """Randomly walk every non-frozen ticker's price every PRICE_DRIFT_INTERVAL seconds."""
-        await bot.wait_until_ready()
-        await asyncio.sleep(PRICE_DRIFT_INTERVAL)  # wait one full cycle before first drift
-        while True:
-            try:
-                def _drift():
-                    with get_conn() as conn:
-                        rows = conn.execute(
-                            "SELECT ticker, gold_pool, share_pool, is_frozen FROM tickers"
+async def background_price_drift():
+    """Randomly walk every non-frozen ticker's price every PRICE_DRIFT_INTERVAL seconds."""
+    await bot.wait_until_ready()
+    logger.info("Starting price drift task with interval %s seconds", PRICE_DRIFT_INTERVAL)
+    await asyncio.sleep(PRICE_DRIFT_INTERVAL)  # wait one full cycle before first drift
+    while True:
+        try:
+            def _drift():
+                with get_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT ticker, gold_pool, share_pool, is_frozen FROM tickers"
+                    ).fetchall()
+                    changes = []
+                    now_iso = datetime.utcnow().isoformat()
+                    cutoff  = (datetime.utcnow() - timedelta(days=PRICE_HISTORY_DAYS)).isoformat()
+                    for ticker, gp, sp, is_frozen in rows:
+                        if is_frozen:
+                            continue
+                        # ── momentum: look at last 2 recorded prices ──────────
+                        hist = conn.execute(
+                            "SELECT price FROM price_history WHERE ticker = ? "
+                            "ORDER BY recorded_at DESC LIMIT 2", (ticker,)
                         ).fetchall()
-                        changes = []
-                        now_iso = datetime.utcnow().isoformat()
-                        cutoff  = (datetime.utcnow() - timedelta(days=PRICE_HISTORY_DAYS)).isoformat()
-                        for ticker, gp, sp, is_frozen in rows:
-                            if is_frozen:
-                                continue
-                            # ── momentum: look at last 2 recorded prices ──────────
-                            hist = conn.execute(
-                                "SELECT price FROM price_history WHERE ticker = ? "
-                                "ORDER BY recorded_at DESC LIMIT 2", (ticker,)
-                            ).fetchall()
-                            momentum = 0.0
-                            if len(hist) == 2:
-                                prev2, prev1 = hist[1][0], hist[0][0]
-                                if prev2 > 0:
-                                    momentum = (prev1 - prev2) / prev2
-                            # ── random drift + dampened momentum bias ─────────────
-                            vol   = TICKER_VOLATILITY.get(ticker, 0.015)
-                            noise = random.gauss(0, vol)
-                            drift = noise + MOMENTUM_FACTOR * momentum
-                            drift = max(-0.12, min(0.12, drift))
-                            new_gp = max(1, int(gp * (1 + drift)))
-                            conn.execute(
-                                "UPDATE tickers SET gold_pool = ?, last_updated = CURRENT_TIMESTAMP WHERE ticker = ?",
-                                (new_gp, ticker)
-                            )
-                            old_price = gp / sp if sp else 0
-                            new_price = new_gp / sp if sp else 0
-                            # ── record snapshot ───────────────────────────────────
-                            conn.execute(
-                                "INSERT INTO price_history(ticker, price, recorded_at) VALUES (?, ?, ?)",
-                                (ticker, new_price, now_iso)
-                            )
-                            changes.append((ticker, old_price, new_price, drift))
-                        # ── prune old history ─────────────────────────────────────
+                        momentum = 0.0
+                        if len(hist) == 2:
+                            prev2, prev1 = hist[1][0], hist[0][0]
+                            if prev2 > 0:
+                                momentum = (prev1 - prev2) / prev2
+                        # ── random drift + dampened momentum bias ─────────────
+                        vol   = TICKER_VOLATILITY.get(ticker, 0.015)
+                        noise = random.gauss(0, vol)
+                        drift = noise + MOMENTUM_FACTOR * momentum
+                        drift = max(-0.12, min(0.12, drift))
+                        new_gp = max(1, int(gp * (1 + drift)))
                         conn.execute(
-                            "DELETE FROM price_history WHERE recorded_at < ?", (cutoff,)
+                            "UPDATE tickers SET gold_pool = ?, last_updated = CURRENT_TIMESTAMP WHERE ticker = ?",
+                            (new_gp, ticker)
                         )
-                        conn.commit()
-                        return changes
-                changes = await asyncio.to_thread(_drift)
-                if changes:
-                    logger.info(
-                        "Price drift: %s",
-                        "  ".join(f"{t} {op:.4f}→{np:.4f} ({d*100:+.1f}%)" for t, op, np, d in changes)
+                        old_price = gp / sp if sp else 0
+                        new_price = new_gp / sp if sp else 0
+                        # ── record snapshot ───────────────────────────────────
+                        conn.execute(
+                            "INSERT INTO price_history(ticker, price, recorded_at) VALUES (?, ?, ?)",
+                            (ticker, new_price, now_iso)
+                        )
+                        changes.append((ticker, old_price, new_price, drift))
+                    # ── prune old history ─────────────────────────────────────
+                    conn.execute(
+                        "DELETE FROM price_history WHERE recorded_at < ?", (cutoff,)
                     )
-            except Exception:
-                logger.exception("Price drift task failed")
-            await asyncio.sleep(PRICE_DRIFT_INTERVAL)
+                    conn.commit()
+                    return changes
+            changes = await asyncio.to_thread(_drift)
+            if changes:
+                logger.info(
+                    "Price drift: %s",
+                    "  ".join(f"{t} {op:.4f}→{np:.4f} ({d*100:+.1f}%)" for t, op, np, d in changes)
+                )
+        except Exception:
+            logger.exception("Price drift task failed")
+        await asyncio.sleep(PRICE_DRIFT_INTERVAL)
 
-    async def background_ledger_poller():
-        await bot.wait_until_ready()
-        backoff = 1
-        while True:
-            try:
-                processed, newly_verified = await ingest_ledger_cycle()
-                if processed > 0:
-                    # DM each newly verified user
-                    for discord_id, account_name in newly_verified:
-                        try:
-                            user = await bot.fetch_user(int(discord_id))
-                            if user:
-                                await user.send(
-                                    f"**Verification complete**\n\n"
-                                    f"Your account **{account_name}** has been verified. "
-                                    f"You can now deposit gold and start trading on the Territorial Market."
-                                )
-                        except Exception:
-                            logger.warning("Could not DM verified user %s", discord_id)
-                    # Notify admin channel
-                    try:
-                        if ADMIN_CHANNEL_ID:
-                            ch = bot.get_channel(ADMIN_CHANNEL_ID)
-                            if ch:
-                                names = ", ".join(name for _, name in newly_verified)
-                                await ch.send(f"Ledger: verified {processed} account(s) — {names}.")
-                    except Exception:
-                        logger.exception("Failed to notify admin channel")
-                    # Log deposits / verifications to activity log
-                    try:
-                        act_ch = bot.get_channel(ACTIVITY_LOG_CHANNEL_ID)
-                        if act_ch:
-                            for did, name in newly_verified:
-                                def _gold(d=did):
-                                    with get_conn() as c:
-                                        r = c.execute("SELECT internal_gold FROM users WHERE discord_id=?", (d,)).fetchone()
-                                        return r[0] if r else 0
-                                bal = await asyncio.to_thread(_gold)
-                                await act_ch.send(
-                                    f"DEPOSIT  **{name}** verified — balance now **{bal:,} gold**"
-                                )
-                    except Exception:
-                        logger.exception("Failed to post deposit activity log")
-                backoff = 1
-            except Exception:
-                logger.exception("Ledger poller failed; backing off")
-                await asyncio.sleep(min(300, backoff))
-                backoff = min(300, backoff * 2)
-            await asyncio.sleep(LEDGER_POLL_INTERVAL)
 
-    async def background_market_embed():
-        await bot.wait_until_ready()
-        channel = bot.get_channel(MARKET_CHANNEL_ID)
-        if not channel:
-            logger.warning("MARKET_CHANNEL_ID set but channel not found. Check bot permissions.")
-            return
-        logger.info(f"Market embed task started in channel {MARKET_CHANNEL_ID}")
-        market_message = None
-        # Try to recover previously posted message
-        stored_id = await asyncio.to_thread(_get_market_message_id)
-        if stored_id:
-            try:
-                market_message = await channel.fetch_message(stored_id)
-            except Exception:
-                market_message = None
-        while True:
-            try:
-                rows = await asyncio.to_thread(_get_market_data)
-                embed = _build_market_embed(rows)
-                if market_message:
-                    await market_message.edit(embed=embed)
-                else:
-                    market_message = await channel.send(embed=embed)
-                    await asyncio.to_thread(_set_market_message_id, market_message.id)
-            except Exception:
-                logger.exception("Market embed update failed")
-                market_message = None
-            await asyncio.sleep(MARKET_UPDATE_INTERVAL)
+async def background_ledger_poller():
+    await bot.wait_until_ready()
+    backoff = 1
+    while True:
+        try:
+            processed, newly_verified = await ingest_ledger_cycle()
+            if processed > 0:
+                # DM each newly verified user
+                for discord_id, account_name in newly_verified:
+                    try:
+                        user = await bot.fetch_user(int(discord_id))
+                        if user:
+                            await user.send(
+                                f"**Verification complete**\n\n"
+                                f"Your account **{account_name}** has been verified. "
+                                f"You can now deposit gold and start trading on the Territorial Market."
+                            )
+                    except Exception:
+                        logger.warning("Could not DM verified user %s", discord_id)
+                # Notify admin channel
+                try:
+                    if ADMIN_CHANNEL_ID:
+                        ch = bot.get_channel(ADMIN_CHANNEL_ID)
+                        if ch:
+                            names = ", ".join(name for _, name in newly_verified)
+                            await ch.send(f"Ledger: verified {processed} account(s) — {names}.")
+                except Exception:
+                    logger.exception("Failed to notify admin channel")
+                # Log deposits / verifications to activity log
+                try:
+                    act_ch = bot.get_channel(ACTIVITY_LOG_CHANNEL_ID)
+                    if act_ch:
+                        for did, name in newly_verified:
+                            def _gold(d=did):
+                                with get_conn() as c:
+                                    r = c.execute("SELECT internal_gold FROM users WHERE discord_id=?", (d,)).fetchone()
+                                    return r[0] if r else 0
+                            bal = await asyncio.to_thread(_gold)
+                            await act_ch.send(
+                                f"DEPOSIT  **{name}** verified — balance now **{bal:,} gold**"
+                            )
+                except Exception:
+                    logger.exception("Failed to post deposit activity log")
+            backoff = 1
+        except Exception:
+            logger.exception("Ledger poller failed; backing off")
+            await asyncio.sleep(min(300, backoff))
+            backoff = min(300, backoff * 2)
+        await asyncio.sleep(LEDGER_POLL_INTERVAL)
+
+
+async def background_market_embed():
+    await bot.wait_until_ready()
+    channel = bot.get_channel(MARKET_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(MARKET_CHANNEL_ID)
+        except Exception as exc:
+            logger.warning("MARKET_CHANNEL_ID set but channel not found. Check bot permissions or channel access: %s", exc)
+    if not channel:
+        logger.warning("MARKET_CHANNEL_ID set but channel not found. Check bot permissions.")
+        return
+    logger.info(f"Market embed task started in channel {MARKET_CHANNEL_ID}")
+    market_message = None
+    # Try to recover previously posted message
+    stored_id = await asyncio.to_thread(_get_market_message_id)
+    if stored_id:
+        try:
+            market_message = await channel.fetch_message(stored_id)
+        except Exception:
+            market_message = None
+    while True:
+        try:
+            rows = await asyncio.to_thread(_get_market_data)
+            embed = _build_market_embed(rows)
+            if market_message:
+                await market_message.edit(embed=embed)
+            else:
+                market_message = await channel.send(embed=embed)
+                await asyncio.to_thread(_set_market_message_id, market_message.id)
+        except Exception:
+            logger.exception("Market embed update failed")
+            market_message = None
+        await asyncio.sleep(MARKET_UPDATE_INTERVAL)
 
 
 # ---- If run as script, initialize DB and optionally start bot ----
