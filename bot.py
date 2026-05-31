@@ -228,15 +228,15 @@ def init_db():
         conn.executescript(sql)
         # seed tickers if missing — (ticker, gold_pool, share_pool) → price = gold_pool/share_pool
         TICKER_SEED = [
-            ("EURO", 300000, 120000),   # 2.50 — Europe, flagship large-cap
-            ("STRM", 128000,  40000),   # 3.20 — Streamers, influencer premium
-            ("ASIA", 180000, 100000),   # 1.80 — Asia, established market
-            ("CLAN",  36000,  30000),   # 1.20 — Top clans composite
-            ("AMER", 252000, 180000),   # 1.40 — Americas, emerging large-cap
-            ("MENA",  52500,  70000),   # 0.75 — Middle East & North Africa
-            ("AFRI",  48000,  80000),   # 0.60 — Africa, growth play
-            ("PACI",  30000,  60000),   # 0.50 — Pacific, small-cap
-            ("BOTS",   1500,  10000),   # 0.15 — Bot accounts, speculative
+            ("EURO", 3000000,  60000),   # 50.00 — Europe, flagship blue-chip
+            ("STRM", 128000,  40000),    # 3.20 — Streamers, influencer premium
+            ("ASIA",  50000, 100000),    # 0.50 — Asia, established market
+            ("CLAN",  36000,  30000),    # 1.20 — Top clans composite
+            ("AMER", 252000, 180000),    # 1.40 — Americas, emerging large-cap
+            ("MENA",  52500,  70000),    # 0.75 — Middle East & North Africa
+            ("AFRI",  48000,  80000),    # 0.60 — Africa, growth play
+            ("PACI",  30000,  60000),    # 0.50 — Pacific, small-cap
+            ("BOTS",   1500,  10000),    # 0.15 — Bot accounts, speculative
         ]
         cur = conn.execute("SELECT COUNT(*) FROM tickers")
         if cur.fetchone()[0] == 0:
@@ -906,7 +906,7 @@ else:
 
     TICKERS = ["EURO", "STRM", "ASIA", "CLAN", "AMER", "MENA", "AFRI", "PACI", "BOTS"]
 
-    # Volatility per 5-min drift cycle (std-dev fraction of gold pool)
+    # Volatility per 3-min drift cycle (std-dev fraction of gold pool)
     TICKER_VOLATILITY = {
         "EURO": 0.008,   # 0.8% — large-cap, stable
         "STRM": 0.025,   # 2.5% — influencer-driven, swings
@@ -918,7 +918,7 @@ else:
         "PACI": 0.020,
         "BOTS": 0.040,   # 4.0% — highly speculative
     }
-    PRICE_DRIFT_INTERVAL = 300   # seconds between automatic price updates
+    PRICE_DRIFT_INTERVAL = 180   # seconds between automatic price updates
     MOMENTUM_FACTOR    = 0.30   # how much previous drift biases the next one (0 = no memory, 1 = full carry)
     PRICE_HISTORY_DAYS = 7      # days of price history to retain
 
@@ -2016,24 +2016,33 @@ else:
 
     def _build_market_embed(rows):
         now = datetime.utcnow().strftime("%H:%M:%S UTC")
+        one_hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
         embed = discord.Embed(
             title="Territorial Market",
-            description=f"Live prices updated every {MARKET_UPDATE_INTERVAL}s",
+            description=f"Live prices updated every {MARKET_UPDATE_INTERVAL}s — change vs 1h ago",
             color=0x2b2d31
         )
-        for ticker, gold_pool, share_pool, day_start_price, is_frozen in rows:
-            price = gold_pool / share_pool if share_pool else 0
-            change = ((price - day_start_price) / day_start_price * 100) if day_start_price else 0
-            bar_length = 8
-            filled = max(0, min(bar_length, round((change + 15) / 30 * bar_length)))
-            bar = "█" * filled + "░" * (bar_length - filled)
-            direction = "+" if change >= 0 else ""
-            status = "FROZEN" if is_frozen else f"{direction}{change:.2f}%"
-            embed.add_field(
-                name=f"`{ticker}`",
-                value=f"**{price:.4f}** gold/share\n`{bar}` {status}",
-                inline=True
-            )
+        with get_conn() as conn:
+            for ticker, gold_pool, share_pool, day_start_price, is_frozen in rows:
+                price = gold_pool / share_pool if share_pool else 0
+                hist_row = conn.execute(
+                    "SELECT price FROM price_history WHERE ticker = ? AND recorded_at <= ? ORDER BY recorded_at DESC LIMIT 1",
+                    (ticker, one_hour_ago)
+                ).fetchone()
+                reference_price = hist_row[0] if hist_row and hist_row[0] else None
+                if reference_price is None or reference_price == 0:
+                    reference_price = day_start_price if day_start_price else price
+                change = ((price - reference_price) / reference_price * 100) if reference_price else 0
+                bar_length = 8
+                filled = max(0, min(bar_length, round((change + 15) / 30 * bar_length)))
+                bar = "█" * filled + "░" * (bar_length - filled)
+                direction = "+" if change >= 0 else ""
+                status = "FROZEN" if is_frozen else f"{direction}{change:.2f}%"
+                embed.add_field(
+                    name=f"`{ticker}`",
+                    value=f"**{price:.4f}** gold/share\n`{bar}` {status}",
+                    inline=True
+                )
         embed.set_footer(text=f"Last updated {now}")
         return embed
 
