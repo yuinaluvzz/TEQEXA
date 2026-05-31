@@ -695,9 +695,10 @@ async def fetch_live_ledger_rows(since_ts):
         enable_cleanup_closed=True
     )
     
-    for attempt in range(max_retries):
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+    # Create session once outside the loop to avoid session closed errors
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        for attempt in range(max_retries):
+            try:
                 logger.debug(f"Ledger fetch attempt {attempt + 1}/{max_retries}")
                 async with session.get(LEDGER_URL, headers=headers, ssl=False) as resp:
                     if resp.status != 200:
@@ -717,33 +718,33 @@ async def fetch_live_ledger_rows(since_ts):
                             await asyncio.sleep(min(2 ** attempt, 16))
                             continue
                         return []
-        except aiohttp.ServerDisconnectedError as e:
-            logger.warning("Ledger fetch attempt %d/%d failed (server disconnected)", attempt + 1, max_retries)
-            if attempt < max_retries - 1:
-                await asyncio.sleep(min(2 ** attempt, 16))
-                continue
-            logger.error("Failed to fetch live ledger after %d attempts (server disconnected)", max_retries)
-            return []
-        except (aiohttp.ClientError, aiohttp.ClientConnectorError) as e:
-            logger.warning("Ledger fetch attempt %d/%d failed: %s", attempt + 1, max_retries, type(e).__name__)
-            if attempt < max_retries - 1:
-                await asyncio.sleep(min(2 ** attempt, 16))
-                continue
-            logger.error("Failed to fetch live ledger after %d attempts", max_retries)
-            return []
-        except asyncio.TimeoutError:
-            logger.warning("Ledger fetch attempt %d/%d timed out", attempt + 1, max_retries)
-            if attempt < max_retries - 1:
-                await asyncio.sleep(min(2 ** (attempt + 1), 16))
-                continue
-            logger.error("Failed to fetch live ledger after %d attempts (timeout)", max_retries)
-            return []
-        except Exception as e:
-            logger.error("Unexpected error fetching ledger on attempt %d: %s", attempt + 1, str(e))
-            if attempt < max_retries - 1:
-                await asyncio.sleep(min(2 ** attempt, 16))
-                continue
-            return []
+            except aiohttp.ServerDisconnectedError as e:
+                logger.warning("Ledger fetch attempt %d/%d failed (server disconnected)", attempt + 1, max_retries)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(min(2 ** attempt, 16))
+                    continue
+                logger.error("Failed to fetch live ledger after %d attempts (server disconnected)", max_retries)
+                return []
+            except (aiohttp.ClientError, aiohttp.ClientConnectorError) as e:
+                logger.warning("Ledger fetch attempt %d/%d failed: %s", attempt + 1, max_retries, type(e).__name__)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(min(2 ** attempt, 16))
+                    continue
+                logger.error("Failed to fetch live ledger after %d attempts", max_retries)
+                return []
+            except asyncio.TimeoutError:
+                logger.warning("Ledger fetch attempt %d/%d timed out", attempt + 1, max_retries)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(min(2 ** (attempt + 1), 16))
+                    continue
+                logger.error("Failed to fetch live ledger after %d attempts (timeout)", max_retries)
+                return []
+            except Exception as e:
+                logger.error("Unexpected error fetching ledger on attempt %d: %s", attempt + 1, str(e))
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(min(2 ** attempt, 16))
+                    continue
+                return []
 
     if not text:
         logger.warning("No ledger text received after %d attempts", max_retries)
@@ -866,7 +867,7 @@ def process_rows_in_db(rows):
                     conn.execute(
                         "INSERT OR IGNORE INTO verifications(tx_id, discord_id, game_name, nonce, raw_payload, verified_at) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
-                        (tx_id, discord_id, gname, nonce, json.dumps(e), datetime.utcnow().isoformat())
+                        (tx_id, discord_id, gname, nonce, json.dumps(e), datetime.now(datetime.timezone.utc).isoformat())
                     )
                     conn.execute("UPDATE users SET verified = 1, internal_gold = internal_gold + ? WHERE discord_id = ?",
                                  (amount, discord_id))
@@ -909,7 +910,7 @@ async def ingest_ledger_cycle():
                 ts = int(e.get("timestamp_ts", 0)) if e.get("timestamp_ts") else 0
                 # if timestamp not provided, use current time
                 if ts == 0:
-                    ts = int(datetime.utcnow().timestamp())
+                    ts = int(datetime.now(datetime.timezone.utc).timestamp())
                 tx_id = e.get("tx_id") or f"{ts}_{e.get('game_name')}_{e.get('amount')}"
                 rows.append({
                     "tx_id": tx_id,
@@ -951,12 +952,12 @@ def export_withdrawals_csv():
                 "requested_at": r[4]
             })
     if not df_rows:
-        path = os.path.join("exports", f"withdrawals_empty_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv")
+        path = os.path.join("exports", f"withdrawals_empty_{datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}.csv")
         with open(path, "w", encoding="utf-8") as f:
             f.write("empty\n")
         return path
     import csv
-    path = os.path.join("exports", f"withdrawals_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv")
+    path = os.path.join("exports", f"withdrawals_{datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["withdrawal_id", "discord_id", "game_name", "amount", "requested_at"])
         writer.writeheader()
@@ -1108,7 +1109,7 @@ else:
                     embed = discord.Embed(
                         title="📈 BUY Trade",
                         color=discord.Color.green(),
-                        timestamp=datetime.utcnow()
+                        timestamp=datetime.now(datetime.timezone.utc)
                     )
                     embed.add_field(name="Player", value=label, inline=True)
                     embed.add_field(name="Ticker", value=f"`{ticker.upper()}`", inline=True)
@@ -1165,7 +1166,7 @@ else:
                     embed = discord.Embed(
                         title="📉 SELL Trade",
                         color=discord.Color.red(),
-                        timestamp=datetime.utcnow()
+                        timestamp=datetime.now(datetime.timezone.utc)
                     )
                     embed.add_field(name="Player", value=label, inline=True)
                     embed.add_field(name="Ticker", value=f"`{ticker.upper()}`", inline=True)
@@ -1308,7 +1309,7 @@ else:
         sym = ticker.upper()
 
         def _fetch_history(sym, hours):
-            cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+            cutoff = (datetime.now(datetime.timezone.utc) - timedelta(hours=hours)).isoformat()
             with get_conn() as conn:
                 # Current ticker info
                 trow = conn.execute(
@@ -1516,7 +1517,7 @@ else:
             with get_conn() as conn:
                 conn.execute("INSERT OR IGNORE INTO users(discord_id, game_name, internal_gold, verified) VALUES (?, ?, 0, 1)", (did, gname))
                 conn.execute("INSERT OR IGNORE INTO verifications(tx_id, discord_id, game_name, nonce, raw_payload, verified_at) VALUES (?, ?, ?, ?, ?, ?)",
-                             (tx, did, gname, "FORCE", json.dumps({"forced_by": str(interaction.user.id), "tx_id": tx}), datetime.utcnow().isoformat()))
+                             (tx, did, gname, "FORCE", json.dumps({"forced_by": str(interaction.user.id), "tx_id": tx}), datetime.now(datetime.timezone.utc).isoformat()))
                 conn.commit()
         await asyncio.to_thread(_force, discord_id, tx_id, game_name)
         await interaction.response.send_message(f"Verification applied: `{discord_id}` registered as **{game_name}**.")
@@ -2137,8 +2138,8 @@ else:
             conn.commit()
 
     def _build_market_embed(rows):
-        now = datetime.utcnow().strftime("%H:%M:%S UTC")
-        one_hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        now = datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
+        one_hour_ago = (datetime.now(datetime.timezone.utc) - timedelta(hours=1)).isoformat()
         embed = discord.Embed(
             title="Territorial Market",
             description=f"Live prices updated every {MARKET_UPDATE_INTERVAL}s — change vs 1h ago",
@@ -2249,7 +2250,7 @@ else:
         """Reset day_start_price to current price at UTC midnight each day."""
         await bot.wait_until_ready()
         while True:
-            now = datetime.utcnow()
+            now = datetime.now(datetime.timezone.utc)
             next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             await asyncio.sleep((next_midnight - now).total_seconds())
             try:
@@ -2317,8 +2318,8 @@ async def background_price_drift():
                         "SELECT ticker, gold_pool, share_pool, is_frozen FROM tickers"
                     ).fetchall()
                     changes = []
-                    now_iso = datetime.utcnow().isoformat()
-                    cutoff  = (datetime.utcnow() - timedelta(days=PRICE_HISTORY_DAYS)).isoformat()
+                    now_iso = datetime.now(datetime.timezone.utc).isoformat()
+                    cutoff  = (datetime.now(datetime.timezone.utc) - timedelta(days=PRICE_HISTORY_DAYS)).isoformat()
                     for ticker, gp, sp, is_frozen in rows:
                         if is_frozen:
                             continue
