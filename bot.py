@@ -66,6 +66,7 @@ except ValueError:
     logger.warning("MARKET_CHANNEL_ID is invalid: %r", _market_ch_raw)
 WITHDRAWAL_LOG_CHANNEL_ID  = 1510444352294621224   # #withdrawal-log — admin notifications
 ACTIVITY_LOG_CHANNEL_ID    = 1510444499334336743   # #activity-log — all market events
+TRADE_LOG_CHANNEL_ID       = 1510498410271211660   # #trade-log — all trade logs
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)   # set for instant slash command sync
 HEALTH_PORT = int(os.getenv("PORT", "8080"))
 LEDGER_FILE = os.path.join("mock_ledger", "ledger.json")
@@ -324,7 +325,13 @@ class AMM:
                     fee += Decimal("0.005")
                 if pct_of_pool > Decimal("0.01"):
                     fee += Decimal("0.01")
-                net_gold = (gross * (Decimal("1") - fee)).quantize(Decimal("1"))
+                # Calculate fee amount with proper rounding (ceiling to ensure fee is captured)
+                fee_decimal = (gross * fee)
+                fee_int = int(fee_decimal)
+                # If there's a fractional part and we're not collecting any fee, round up to 1
+                if fee_int == 0 and fee_decimal > 0:
+                    fee_int = 1
+                net_gold = gross - Decimal(fee_int)
                 k = G * S
                 G_new = G + net_gold
                 S_new = (k / G_new).quantize(Decimal("1"))
@@ -349,7 +356,6 @@ class AMM:
                 else:
                     conn.execute("INSERT INTO portfolios(discord_id, ticker, shares) VALUES (?, ?, ?)",
                                  (discord_id, ticker, int(shares_received)))
-                fee_int = int((gross - net_gold))
                 conn.execute("""INSERT INTO trades(discord_id, ticker, type, gross_gold, net_gold, shares, fee, price_before, price_after, maker_flag)
                                 VALUES (?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 0)""",
                              (discord_id, ticker, int(gross), int(net_gold), int(shares_received), fee_int, str(price_before), str(price_after)))
@@ -386,7 +392,13 @@ class AMM:
                     fee += Decimal("0.005")
                 if pct_of_pool > Decimal("0.01"):
                     fee += Decimal("0.01")
-                net_gold = (gross_gold_out * (Decimal("1") - fee)).quantize(Decimal("1"))
+                # Calculate fee amount with proper rounding (ceiling to ensure fee is captured)
+                fee_decimal = (gross_gold_out * fee)
+                fee_int = int(fee_decimal)
+                # If there's a fractional part and we're not collecting any fee, round up to 1
+                if fee_int == 0 and fee_decimal > 0:
+                    fee_int = 1
+                net_gold = gross_gold_out - Decimal(fee_int)
                 price_before = self._price(G, S)
                 price_after = self._price(G_new, S_new)
                 change = abs((price_after - day_start_price) / day_start_price) if day_start_price > 0 else Decimal("0")
@@ -403,7 +415,6 @@ class AMM:
                              (int(shares), discord_id, ticker))
                 conn.execute("UPDATE tickers SET gold_pool = ?, share_pool = ?, last_updated = CURRENT_TIMESTAMP WHERE ticker = ?",
                              (int(G_new), int(S_new), ticker))
-                fee_int = int((gross_gold_out - net_gold))
                 conn.execute("""INSERT INTO trades(discord_id, ticker, type, gross_gold, net_gold, shares, fee, price_before, price_after, maker_flag)
                                 VALUES (?, ?, 'SELL', ?, ?, ?, ?, ?, ?, 0)""",
                              (discord_id, ticker, int(gross_gold_out), int(net_gold), int(shares), fee_int, str(price_before), str(price_after)))
@@ -749,12 +760,14 @@ def process_rows_in_db(rows):
     Process ledger rows (list of dicts) in DB thread.
     - Verifies pending accounts by matching sender account name + receiver == clan bank + exact amount.
     - Credits internal_gold for any transfer sent to the clan bank (deposits).
+    - Auto-completes pending withdrawals when exact amount is sent to clan bank.
     Returns (count, newly_verified) where newly_verified is list of (discord_id, account_name).
     """
     if not rows:
         return 0, []
     processed = 0
     newly_verified = []
+    completed_withdrawals = []
     with get_conn() as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         cur = conn.execute("SELECT log_id, actor, details FROM audit_logs WHERE action = 'pending_nonce'")
@@ -776,6 +789,20 @@ def process_rows_in_db(rows):
             cur3 = conn.execute("SELECT discord_id, verified FROM users WHERE game_name = ?", (sender,))
             user_row = cur3.fetchone()
             if user_row and user_row[1]:
+                # Check if this matches a pending withdrawal
+                cur_withdrawal = conn.execute(
+                    "SELECT withdrawal_id, amount FROM withdrawals WHERE discord_id = ? AND status = 'PENDING' ORDER BY requested_at ASC LIMIT 1",
+                    (user_row[0],)
+                )
+                withdrawal_row = cur_withdrawal.fetchone()
+                if withdrawal_row and withdrawal_row[1] == amount:
+                    # Auto-complete the withdrawal
+                    withdrawal_id, _ = withdrawal_row
+                    conn.execute("UPDATE withdrawals SET status = 'COMPLETED' WHERE withdrawal_id = ?", (withdrawal_id,))
+                    completed_withdrawals.append((user_row[0], sender, amount, withdrawal_id))
+                    conn.commit()
+                    continue
+                # Regular deposit (no matching withdrawal)
                 conn.execute("UPDATE users SET internal_gold = internal_gold + ? WHERE discord_id = ?",
                              (amount, user_row[0]))
                 conn.commit()
@@ -805,6 +832,16 @@ def process_rows_in_db(rows):
                     newly_verified.append((discord_id, gname))
                     processed += 1
                     break
+    
+    # Send notifications for auto-completed withdrawals
+    if completed_withdrawals:
+        try:
+            for discord_id, game_name, amount, wid in completed_withdrawals:
+                # These will be logged by the background task
+                logger.info(f"Withdrawal #{wid} auto-completed: {game_name} sent {amount} gold")
+        except Exception:
+            pass
+    
     return processed, newly_verified
 
 
@@ -1006,6 +1043,7 @@ else:
                 f"at {res['price_after']:.6f} gold/share. Fee: {res['fee']:,} gold."
             )
             log_ch = bot.get_channel(ACTIVITY_LOG_CHANNEL_ID)
+            trade_log_ch = bot.get_channel(TRADE_LOG_CHANNEL_ID)
             if log_ch:
                 try:
                     name = await asyncio.to_thread(
@@ -1018,6 +1056,26 @@ else:
                     )
                 except Exception:
                     logger.exception("Failed to post buy activity log")
+            if trade_log_ch:
+                try:
+                    name = await asyncio.to_thread(
+                        lambda: get_conn().execute("SELECT game_name FROM users WHERE discord_id=?", (discord_id,)).fetchone()
+                    )
+                    label = name[0] if name else str(interaction.user)
+                    embed = discord.Embed(
+                        title="📈 BUY Trade",
+                        color=discord.Color.green(),
+                        timestamp=datetime.utcnow()
+                    )
+                    embed.add_field(name="Player", value=label, inline=True)
+                    embed.add_field(name="Ticker", value=f"`{ticker.upper()}`", inline=True)
+                    embed.add_field(name="Shares", value=f"{res['shares']:,}", inline=True)
+                    embed.add_field(name="Price/Share", value=f"{res['price_after']:.6f}", inline=True)
+                    embed.add_field(name="Total Spent", value=f"{gold:,}", inline=True)
+                    embed.add_field(name="Fee", value=f"{res['fee']:,}", inline=True)
+                    await trade_log_ch.send(embed=embed)
+                except Exception:
+                    logger.exception("Failed to post buy trade log")
 
     @bot.tree.command(name="sell", description="Sell shares of a ticker to get gold back")
     @app_commands.describe(ticker="Which ticker to sell", shares="Number of shares to sell")
@@ -1042,6 +1100,7 @@ else:
                 f"Fee: {res['fee']:,} gold."
             )
             log_ch = bot.get_channel(ACTIVITY_LOG_CHANNEL_ID)
+            trade_log_ch = bot.get_channel(TRADE_LOG_CHANNEL_ID)
             if log_ch:
                 try:
                     name = await asyncio.to_thread(
@@ -1054,6 +1113,26 @@ else:
                     )
                 except Exception:
                     logger.exception("Failed to post sell activity log")
+            if trade_log_ch:
+                try:
+                    name = await asyncio.to_thread(
+                        lambda: get_conn().execute("SELECT game_name FROM users WHERE discord_id=?", (discord_id,)).fetchone()
+                    )
+                    label = name[0] if name else str(interaction.user)
+                    embed = discord.Embed(
+                        title="📉 SELL Trade",
+                        color=discord.Color.red(),
+                        timestamp=datetime.utcnow()
+                    )
+                    embed.add_field(name="Player", value=label, inline=True)
+                    embed.add_field(name="Ticker", value=f"`{ticker.upper()}`", inline=True)
+                    embed.add_field(name="Shares", value=f"{shares:,}", inline=True)
+                    embed.add_field(name="Price/Share", value=f"{res['price_after']:.6f}", inline=True)
+                    embed.add_field(name="Total Received", value=f"{res['gold']:,}", inline=True)
+                    embed.add_field(name="Fee", value=f"{res['fee']:,}", inline=True)
+                    await trade_log_ch.send(embed=embed)
+                except Exception:
+                    logger.exception("Failed to post sell trade log")
 
     @bot.tree.command(name="portfolio", description="View your gold balance and share holdings")
     async def portfolio(interaction: discord.Interaction):
