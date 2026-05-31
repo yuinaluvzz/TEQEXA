@@ -44,7 +44,7 @@ from dotenv import load_dotenv
 # ---- Configuration and environment ----
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-DB_PATH = os.getenv("DB_PATH", "market.db")
+DB_PATH = os.getenv("DB_PATH", "/data/market.db")
 ADMIN_CHANNEL_ID           = int(os.getenv("ADMIN_CHANNEL_ID", "0") or 0)
 # Comma-separated Discord user IDs that may run admin commands (set via ADMIN secret)
 ADMIN_IDS                  = {s.strip() for s in os.getenv("ADMIN", "").split(",") if s.strip()}
