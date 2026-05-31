@@ -387,16 +387,41 @@ async def fetch_live_ledger_rows(since_ts):
         return []
 
     rows = []
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(LEDGER_URL) as resp:
-                if resp.status != 200:
-                    logger.warning("Ledger fetch returned status %s", resp.status)
-                    return []
-                text = await resp.text()
-    except Exception:
-        logger.exception("Failed to fetch live ledger")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/plain, */*",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    }
+
+    max_retries = 3
+    text = ""
+    for attempt in range(max_retries):
+        try:
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5, ttl_dns_cache=300)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with session.get(LEDGER_URL, headers=headers, ssl=False) as resp:
+                    if resp.status != 200:
+                        logger.warning("Ledger fetch returned status %s", resp.status)
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return []
+                    text = await resp.text()
+                    break
+        except aiohttp.ClientError as e:
+            logger.warning("Ledger fetch attempt %d/%d failed: %s", attempt + 1, max_retries, str(e))
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            logger.exception("Failed to fetch live ledger after %d attempts", max_retries)
+            return []
+        except Exception as e:
+            logger.exception("Unexpected error fetching ledger: %s", str(e))
+            return []
+
+    if not text:
         return []
 
     # The endpoint returns CSV-like content. Parse lines.
