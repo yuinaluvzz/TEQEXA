@@ -174,7 +174,41 @@ def init_db():
       price REAL NOT NULL,
       recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-    CREATE INDEX IF NOT EXISTS idx_ph_ticker_time ON price_history(ticker, recorded_at);
+        CREATE INDEX IF NOT EXISTS idx_ph_ticker_time ON price_history(ticker, recorded_at);
+
+        -- Achievements, dividends, and market events tables (Phase 1 additions)
+        CREATE TABLE IF NOT EXISTS achievements (
+            achievement_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT NOT NULL,
+            achievement_name TEXT NOT NULL,
+            earned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (discord_id) REFERENCES users(discord_id),
+            UNIQUE(discord_id, achievement_name)
+        );
+        CREATE TABLE IF NOT EXISTS dividends_paid (
+            dividend_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (discord_id) REFERENCES users(discord_id)
+        );
+        CREATE TABLE IF NOT EXISTS market_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_name TEXT NOT NULL,
+            event_description TEXT,
+            affected_tickers TEXT,
+            price_impact_percent REAL,
+            event_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            posted_to_discord INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS dividend_config (
+            ticker TEXT PRIMARY KEY,
+            dividend_yield REAL NOT NULL DEFAULT 0.02
+        );
+        CREATE INDEX IF NOT EXISTS idx_achievements_discord ON achievements(discord_id);
+        CREATE INDEX IF NOT EXISTS idx_dividends_discord ON dividends_paid(discord_id);
+        CREATE INDEX IF NOT EXISTS idx_market_events_time ON market_events(event_time);
     """
     with get_conn() as conn:
         conn.executescript(sql)
@@ -372,6 +406,232 @@ class AMM:
 
 
 # ---- Ledger ingestion: live fetch + mock fallback ----
+# ---- Phase 1: Achievements, Dividends, Market Events ----
+
+
+class Achievements:
+    """Track and award player achievements."""
+
+    ACHIEVEMENT_DEFINITIONS = {
+        "first_millionaire": {
+            "name": "First Millionaire",
+            "description": "Reach 1,000,000 gold portfolio value",
+            "trigger": "portfolio_value",
+            "threshold": 1000000
+        },
+        "survived_crash": {
+            "name": "Crash Survivor",
+            "description": "Hold through a 15%+ market crash",
+            "trigger": "price_drop",
+            "threshold": 0.15
+        },
+        "perfect_trade_streak": {
+            "name": "Perfect Trader",
+            "description": "5 consecutive profitable trades",
+            "trigger": "trade_streak",
+            "threshold": 5
+        },
+        "day_trader": {
+            "name": "Day Trader",
+            "description": "Execute 50 trades in a single day",
+            "trigger": "daily_trades",
+            "threshold": 50
+        },
+        "hodler": {
+            "name": "HODLER",
+            "description": "Hold the same ticker for 30 days",
+            "trigger": "hold_duration",
+            "threshold": 30
+        },
+        "diversified": {
+            "name": "Diversified Portfolio",
+            "description": "Own shares in all 9 tickers",
+            "trigger": "ticker_count",
+            "threshold": 9
+        },
+        "dividend_collector": {
+            "name": "Dividend Collector",
+            "description": "Earn 10,000 gold from dividends",
+            "trigger": "dividend_income",
+            "threshold": 10000
+        },
+        "price_alert_prophet": {
+            "name": "Price Prophet",
+            "description": "Hit 10 price alerts successfully",
+            "trigger": "alert_hits",
+            "threshold": 10
+        }
+    }
+
+    @staticmethod
+    def check_and_award(discord_id, trigger_type, data):
+        """Check if user earned an achievement and award it."""
+        with get_conn() as conn:
+            for ach_key, ach_def in Achievements.ACHIEVEMENT_DEFINITIONS.items():
+                if ach_def["trigger"] != trigger_type:
+                    continue
+
+                # Check if already earned
+                cur = conn.execute(
+                    "SELECT achievement_id FROM achievements WHERE discord_id = ? AND achievement_name = ?",
+                    (discord_id, ach_key)
+                )
+                if cur.fetchone():
+                    continue  # Already earned
+
+                # Check if threshold met
+                earned = False
+                if trigger_type == "portfolio_value" and data.get("value", 0) >= ach_def["threshold"]:
+                    earned = True
+                elif trigger_type == "price_drop" and data.get("drop_percent", 0) >= ach_def["threshold"]:
+                    earned = True
+                elif trigger_type == "trade_streak" and data.get("streak", 0) >= ach_def["threshold"]:
+                    earned = True
+                elif trigger_type == "daily_trades" and data.get("count", 0) >= ach_def["threshold"]:
+                    earned = True
+                elif trigger_type == "hold_duration" and data.get("days", 0) >= ach_def["threshold"]:
+                    earned = True
+                elif trigger_type == "ticker_count" and data.get("count", 0) >= ach_def["threshold"]:
+                    earned = True
+                elif trigger_type == "dividend_income" and data.get("total", 0) >= ach_def["threshold"]:
+                    earned = True
+                elif trigger_type == "alert_hits" and data.get("count", 0) >= ach_def["threshold"]:
+                    earned = True
+
+                if earned:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO achievements(discord_id, achievement_name) VALUES (?, ?)",
+                        (discord_id, ach_key)
+                    )
+                    conn.execute(
+                        "INSERT INTO audit_logs(actor, action, details) VALUES (?, ?, ?)",
+                        (discord_id, "achievement_earned", f"Earned: {ach_def['name']}")
+                    )
+                    conn.commit()
+                    logger.info(f"Achievement earned: {discord_id} -> {ach_key}")
+
+
+class Dividends:
+    """Handle dividend payouts."""
+
+    @staticmethod
+    def init_dividend_config():
+        """Initialize dividend yields for tickers."""
+        config = {
+            "EURO": 0.02,   # 2%
+            "STRM": 0.015,  # 1.5%
+            "ASIA": 0.018,  # 1.8%
+            "CLAN": 0.025,  # 2.5%
+            "AMER": 0.016,  # 1.6%
+            "MENA": 0.012,  # 1.2%
+            "AFRI": 0.010,  # 1.0%
+            "PACI": 0.008,  # 0.8%
+            "BOTS": 0.005,  # 0.5%
+        }
+        with get_conn() as conn:
+            for ticker, yield_pct in config.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO dividend_config(ticker, dividend_yield) VALUES (?, ?)",
+                    (ticker, yield_pct)
+                )
+            conn.commit()
+
+    @staticmethod
+    def payout_dividends():
+        """Pay quarterly dividends to all shareholders."""
+        with get_conn() as conn:
+            # Get all tickers and their yields
+            cur = conn.execute("SELECT ticker, dividend_yield FROM dividend_config")
+            tickers = cur.fetchall()
+            
+            total_paid = 0
+            for ticker, yield_pct in tickers:
+                # Get all users holding this ticker
+                cur2 = conn.execute(
+                    "SELECT discord_id, shares FROM portfolios WHERE ticker = ? AND shares > 0",
+                    (ticker,)
+                )
+                holders = cur2.fetchall()
+                
+                for discord_id, shares in holders:
+                    # Calculate dividend: shares * current_price * yield
+                    cur3 = conn.execute(
+                        "SELECT gold_pool, share_pool FROM tickers WHERE ticker = ?",
+                        (ticker,)
+                    )
+                    pool_row = cur3.fetchone()
+                    if not pool_row:
+                        continue
+                    
+                    gold_pool, share_pool = pool_row
+                    current_price = Decimal(gold_pool) / Decimal(share_pool) if share_pool > 0 else Decimal(0)
+                    dividend_amount = int(Decimal(shares) * current_price * Decimal(yield_pct))
+                    
+                    if dividend_amount > 0:
+                        conn.execute(
+                            "UPDATE users SET internal_gold = internal_gold + ? WHERE discord_id = ?",
+                            (dividend_amount, discord_id)
+                        )
+                        conn.execute(
+                            "INSERT INTO dividends_paid(discord_id, ticker, amount) VALUES (?, ?, ?)",
+                            (discord_id, ticker, dividend_amount)
+                        )
+                        total_paid += dividend_amount
+            
+            conn.commit()
+            logger.info(f"Dividend payout complete. Total paid: {total_paid} gold")
+            return total_paid
+
+
+class MarketEvents:
+    """Generate and apply random market events."""
+    
+    EVENTS = [
+        {"name": "Tournament Victory", "tickers": ["EURO"], "impact": 0.05, "desc": "🏆 EURO wins regional tournament!"},
+        {"name": "Scandal", "tickers": ["ASIA"], "impact": -0.08, "desc": "📉 ASIA scandal breaks news"},
+        {"name": "Tech Exploit", "tickers": ["BOTS"], "impact": -0.10, "desc": "🐛 BOTS exploit discovered"},
+        {"name": "Streamer Hype", "tickers": ["STRM"], "impact": 0.07, "desc": "🎬 STRM trending on social media"},
+        {"name": "Clan War", "tickers": ["CLAN"], "impact": 0.06, "desc": "⚔️ CLAN dominates in warfare"},
+        {"name": "Market Crash", "tickers": ["EURO", "ASIA", "AMER"], "impact": -0.15, "desc": "📉 MARKET CRASH: -15% across regions"},
+        {"name": "Bull Run", "tickers": ["MENA", "AFRI", "PACI"], "impact": 0.12, "desc": "📈 BULL RUN: Emerging markets surge"},
+        {"name": "Economic Boom", "tickers": ["AMER"], "impact": 0.09, "desc": "💰 AMER economy booming"},
+    ]
+    
+    @staticmethod
+    def generate_event():
+        """Generate a random market event and apply it."""
+        event = random.choice(MarketEvents.EVENTS)
+        
+        with get_conn() as conn:
+            # Record event
+            conn.execute(
+                "INSERT INTO market_events(event_name, event_description, affected_tickers, price_impact_percent) VALUES (?, ?, ?, ?)",
+                (event["name"], event["desc"], ",".join(event["tickers"]), event["impact"])
+            )
+            
+            # Apply price impact to affected tickers
+            for ticker in event["tickers"]:
+                cur = conn.execute(
+                    "SELECT gold_pool, share_pool FROM tickers WHERE ticker = ?",
+                    (ticker,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    continue
+                
+                gold_pool, share_pool = row
+                impact_multiplier = Decimal(1) + Decimal(event["impact"])
+                new_gold_pool = int(Decimal(gold_pool) * impact_multiplier)
+                
+                conn.execute(
+                    "UPDATE tickers SET gold_pool = ?, last_updated = CURRENT_TIMESTAMP WHERE ticker = ?",
+                    (new_gold_pool, ticker)
+                )
+            
+            conn.commit()
+            logger.info(f"Market event: {event['name']} - Impact: {event['impact']*100:+.1f}%")
+            return event
+
 # The territorial transactions endpoint returns CSV-like lines: time,sender,receiver,amount,fee
 # We parse rows and use timestamp+sender as tx_id. We persist last_seen_time to ledger_state to avoid reprocessing.
 
@@ -1778,26 +2038,75 @@ else:
         return embed
 
     # ---- Bot events ----
+        @bot.tree.command(name="achievements", description="View your achievements")
+        async def cmd_achievements(interaction: discord.Interaction):
+            """Show user's achievements."""
+            discord_id = str(interaction.user.id)
+        
+            with get_conn() as conn:
+                cur = conn.execute(
+                    "SELECT achievement_name, earned_at FROM achievements WHERE discord_id = ? ORDER BY earned_at DESC",
+                    (discord_id,)
+                )
+                achievements = cur.fetchall()
+        
+            if not achievements:
+                await interaction.response.send_message("You haven't earned any achievements yet. Keep trading!", ephemeral=True)
+                return
+        
+            embed = discord.Embed(title="🏆 Your Achievements", color=discord.Color.gold())
+            for ach_name, earned_at in achievements:
+                ach_def = Achievements.ACHIEVEMENT_DEFINITIONS.get(ach_name, {})
+                embed.add_field(
+                    name=ach_def.get("name", ach_name),
+                    value=f"Earned: {earned_at[:10]}",
+                    inline=False
+                )
+        
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @bot.event
-    async def on_ready():
-        try:
-            if GUILD_ID:
-                guild_obj = discord.Object(id=GUILD_ID)
-                bot.tree.copy_global_to(guild=guild_obj)
-                synced = await bot.tree.sync(guild=guild_obj)
-                logger.info(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID} (instant)")
-            else:
-                synced = await bot.tree.sync()
-                logger.info(f"Synced {len(synced)} slash command(s) globally (may take up to 1h to appear)")
-        except Exception:
-            logger.exception("Failed to sync slash commands")
-        logger.info(f"Bot ready as {bot.user}")
-        bot.loop.create_task(background_ledger_poller())
-        bot.loop.create_task(background_price_drift())
-        bot.loop.create_task(background_day_reset())
-        if MARKET_CHANNEL_ID:
-            bot.loop.create_task(background_market_embed())
+        @bot.tree.command(name="dividends", description="View dividend schedule")
+        async def cmd_dividends(interaction: discord.Interaction):
+            """Show dividend yields and next payout."""
+            with get_conn() as conn:
+                cur = conn.execute("SELECT ticker, dividend_yield FROM dividend_config ORDER BY ticker")
+                divs = cur.fetchall()
+        
+            embed = discord.Embed(title="💰 Dividend Schedule", color=discord.Color.green())
+            embed.description = "Quarterly dividend payouts (every 90 days)"
+        
+            for ticker, yield_pct in divs:
+                embed.add_field(name=ticker, value=f"{yield_pct*100:.1f}% yield", inline=True)
+        
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        @bot.event
+        async def on_ready():
+            try:
+                if GUILD_ID:
+                    guild_obj = discord.Object(id=GUILD_ID)
+                    bot.tree.copy_global_to(guild=guild_obj)
+                    synced = await bot.tree.sync(guild=guild_obj)
+                    logger.info(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID} (instant)")
+                else:
+                    synced = await bot.tree.sync()
+                    logger.info(f"Synced {len(synced)} slash command(s) globally (may take up to 1h to appear)")
+            except Exception:
+                logger.exception("Failed to sync slash commands")
+            logger.info(f"Bot ready as {bot.user}")
+            # Initialize dividend config and start background tasks
+            try:
+                Dividends.init_dividend_config()
+            except Exception:
+                logger.exception("Failed to init dividend config")
+
+            bot.loop.create_task(background_ledger_poller())
+            bot.loop.create_task(background_price_drift())
+            bot.loop.create_task(background_day_reset())
+            bot.loop.create_task(background_market_events())
+            bot.loop.create_task(background_dividend_payouts())
+            if MARKET_CHANNEL_ID:
+                bot.loop.create_task(background_market_embed())
 
     async def background_day_reset():
         """Reset day_start_price to current price at UTC midnight each day."""
@@ -1817,6 +2126,46 @@ else:
                 logger.info("Daily day_start_price reset at UTC midnight")
             except Exception:
                 logger.exception("Daily reset failed")
+
+
+async def background_market_events():
+    """Periodically generate market events every 6-12 hours."""
+    await bot.wait_until_ready()
+    while True:
+        # sleep random 6-12 hours
+        delay_hours = random.uniform(6, 12)
+        await asyncio.sleep(delay_hours * 3600)
+        try:
+            event = await asyncio.to_thread(MarketEvents.generate_event)
+            # Post to market channel if configured
+            if MARKET_CHANNEL_ID and event:
+                try:
+                    ch = bot.get_channel(MARKET_CHANNEL_ID)
+                    if ch:
+                        await ch.send(f"Market Event: **{event['name']}** — {event['desc']}")
+                except Exception:
+                    logger.exception("Failed to post market event to channel")
+        except Exception:
+            logger.exception("Market event generation failed")
+
+
+async def background_dividend_payouts():
+    """Pay dividends every 90 days (quarterly)."""
+    await bot.wait_until_ready()
+    while True:
+        # Sleep for 90 days
+        await asyncio.sleep(90 * 24 * 3600)
+        try:
+            total = await asyncio.to_thread(Dividends.payout_dividends)
+            if WITHDRAWAL_LOG_CHANNEL_ID and total > 0:
+                try:
+                    ch = bot.get_channel(WITHDRAWAL_LOG_CHANNEL_ID)
+                    if ch:
+                        await ch.send(f"Quarterly dividends paid: {total} gold distributed to shareholders.")
+                except Exception:
+                    logger.exception("Failed to post dividend summary to channel")
+        except Exception:
+            logger.exception("Dividend payout failed")
 
     async def background_price_drift():
         """Randomly walk every non-frozen ticker's price every PRICE_DRIFT_INTERVAL seconds."""
