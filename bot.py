@@ -664,6 +664,7 @@ async def fetch_live_ledger_rows(since_ts):
     """
     Fetch the live ledger page and parse rows newer than since_ts.
     Returns list of dicts: {tx_id, time, sender, receiver, amount, fee, raw_line}
+    Improved error handling with longer timeouts and connection pooling.
     """
     try:
         import aiohttp
@@ -677,36 +678,75 @@ async def fetch_live_ledger_rows(since_ts):
         "Accept": "text/plain, */*",
         "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
+        "Keep-Alive": "timeout=60, max=100",
     }
 
-    max_retries = 3
+    max_retries = 5
     text = ""
+    
+    # Use longer timeouts and better connector settings
+    timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=60)
+    connector = aiohttp.TCPConnector(
+        limit=5, 
+        limit_per_host=2, 
+        ttl_dns_cache=300,
+        ssl=False,
+        keepalive_timeout=60,
+        enable_cleanup_closed=True
+    )
+    
     for attempt in range(max_retries):
         try:
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5, ttl_dns_cache=300)
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                logger.debug(f"Ledger fetch attempt {attempt + 1}/{max_retries}")
                 async with session.get(LEDGER_URL, headers=headers, ssl=False) as resp:
                     if resp.status != 200:
-                        logger.warning("Ledger fetch returned status %s", resp.status)
+                        logger.warning("Ledger fetch returned status %s on attempt %d", resp.status, attempt + 1)
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(2 ** attempt)
+                            await asyncio.sleep(min(2 ** attempt, 16))  # exponential backoff, max 16s
                             continue
                         return []
-                    text = await resp.text()
-                    break
-        except aiohttp.ClientError as e:
-            logger.warning("Ledger fetch attempt %d/%d failed: %s", attempt + 1, max_retries, str(e))
+                    # Read response in chunks to handle large responses
+                    try:
+                        text = await resp.text(errors='ignore')
+                        logger.debug(f"Successfully fetched ledger ({len(text)} bytes) on attempt {attempt + 1}")
+                        break
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout reading response on attempt %d", attempt + 1)
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(min(2 ** attempt, 16))
+                            continue
+                        return []
+        except aiohttp.ServerDisconnectedError as e:
+            logger.warning("Ledger fetch attempt %d/%d failed (server disconnected)", attempt + 1, max_retries)
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(min(2 ** attempt, 16))
                 continue
-            logger.exception("Failed to fetch live ledger after %d attempts", max_retries)
+            logger.error("Failed to fetch live ledger after %d attempts (server disconnected)", max_retries)
+            return []
+        except (aiohttp.ClientError, aiohttp.ClientConnectorError) as e:
+            logger.warning("Ledger fetch attempt %d/%d failed: %s", attempt + 1, max_retries, type(e).__name__)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(min(2 ** attempt, 16))
+                continue
+            logger.error("Failed to fetch live ledger after %d attempts", max_retries)
+            return []
+        except asyncio.TimeoutError:
+            logger.warning("Ledger fetch attempt %d/%d timed out", attempt + 1, max_retries)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(min(2 ** (attempt + 1), 16))
+                continue
+            logger.error("Failed to fetch live ledger after %d attempts (timeout)", max_retries)
             return []
         except Exception as e:
-            logger.exception("Unexpected error fetching ledger: %s", str(e))
+            logger.error("Unexpected error fetching ledger on attempt %d: %s", attempt + 1, str(e))
+            if attempt < max_retries - 1:
+                await asyncio.sleep(min(2 ** attempt, 16))
+                continue
             return []
 
     if not text:
+        logger.warning("No ledger text received after %d attempts", max_retries)
         return []
 
     # The endpoint returns CSV-like content. Parse lines.
@@ -738,6 +778,9 @@ async def fetch_live_ledger_rows(since_ts):
             "fee": fee,
             "raw_line": line
         })
+    
+    if rows:
+        logger.info(f"Parsed {len(rows)} new ledger entries")
     return rows
 
 
