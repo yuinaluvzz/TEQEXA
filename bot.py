@@ -938,29 +938,15 @@ else:
         lines = [
             "**Territorial Market Bot — Commands**",
             "",
-            "**Account**",
-            "`/link <game_name>` — Link your in-game account and begin verification",
-            "`/status` — Show your gold balance and share positions",
-            "`/portfolio` — Detailed view of your holdings with current prices",
-            "",
-            "**Gold**",
-            "`/deposit` — How to deposit gold into the market",
-            "`/withdraw <amount>` — Request a withdrawal back to your game account",
-            "",
-            "**Trading**",
-            "`/buy <ticker> <gold>` — Buy shares using gold",
-            "`/sell <ticker> <shares>` — Sell shares to receive gold",
-            "`/market` — View live prices and 24h change for all tickers",
-            "",
-            "**Tickers:** EURO · ASIA · AMER · AFRI · MENA · PACI · STRM · CLAN · BOTS",
-            "",
-            "**Verification**",
-            f"After `/link`, send exactly **{VERIFICATION_AMOUNT} gold** to **{CLAN_BANK_ACCOUNT}** from your account.",
-            "The bot detects the transfer and verifies you automatically. You will receive a DM when done.",
-            "",
-            "**Deposits**",
-            f"Send any amount to **{CLAN_BANK_ACCOUNT}**. Gold is credited to your balance automatically.",
         ]
+        commands = sorted(
+            [cmd for cmd in bot.tree.walk_commands() if cmd.name != "help"],
+            key=lambda c: c.name
+        )
+        for cmd in commands:
+            lines.append(f"`/{cmd.name}` — {cmd.description}")
+        lines.append("")
+        lines.append("Use `/help` to see this list anytime.")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @bot.tree.command(name="link", description="Link your Territorial.io account to verify yourself")
@@ -2038,50 +2024,50 @@ else:
         return embed
 
     # ---- Bot events ----
-        @bot.tree.command(name="achievements", description="View your achievements")
-        async def cmd_achievements(interaction: discord.Interaction):
-            """Show user's achievements."""
-            discord_id = str(interaction.user.id)
-        
-            with get_conn() as conn:
-                cur = conn.execute(
-                    "SELECT achievement_name, earned_at FROM achievements WHERE discord_id = ? ORDER BY earned_at DESC",
-                    (discord_id,)
-                )
-                achievements = cur.fetchall()
-        
-            if not achievements:
-                await interaction.response.send_message("You haven't earned any achievements yet. Keep trading!", ephemeral=True)
-                return
-        
-            embed = discord.Embed(title="🏆 Your Achievements", color=discord.Color.gold())
-            for ach_name, earned_at in achievements:
-                ach_def = Achievements.ACHIEVEMENT_DEFINITIONS.get(ach_name, {})
-                embed.add_field(
-                    name=ach_def.get("name", ach_name),
-                    value=f"Earned: {earned_at[:10]}",
-                    inline=False
-                )
-        
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+    @bot.tree.command(name="achievements", description="View your achievements")
+    async def cmd_achievements(interaction: discord.Interaction):
+        """Show user's achievements."""
+        discord_id = str(interaction.user.id)
 
-        @bot.tree.command(name="dividends", description="View dividend schedule")
-        async def cmd_dividends(interaction: discord.Interaction):
-            """Show dividend yields and next payout."""
-            with get_conn() as conn:
-                cur = conn.execute("SELECT ticker, dividend_yield FROM dividend_config ORDER BY ticker")
-                divs = cur.fetchall()
-        
-            embed = discord.Embed(title="💰 Dividend Schedule", color=discord.Color.green())
-            embed.description = "Quarterly dividend payouts (every 90 days)"
-        
-            for ticker, yield_pct in divs:
-                embed.add_field(name=ticker, value=f"{yield_pct*100:.1f}% yield", inline=True)
-        
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+        with get_conn() as conn:
+            cur = conn.execute(
+                "SELECT achievement_name, earned_at FROM achievements WHERE discord_id = ? ORDER BY earned_at DESC",
+                (discord_id,)
+            )
+            achievements = cur.fetchall()
 
-        @bot.event
-        async def on_ready():
+        if not achievements:
+            await interaction.response.send_message("You haven't earned any achievements yet. Keep trading!", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="🏆 Your Achievements", color=discord.Color.gold())
+        for ach_name, earned_at in achievements:
+            ach_def = Achievements.ACHIEVEMENT_DEFINITIONS.get(ach_name, {})
+            embed.add_field(
+                name=ach_def.get("name", ach_name),
+                value=f"Earned: {earned_at[:10]}",
+                inline=False
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="dividends", description="View dividend schedule")
+    async def cmd_dividends(interaction: discord.Interaction):
+        """Show dividend yields and next payout."""
+        with get_conn() as conn:
+            cur = conn.execute("SELECT ticker, dividend_yield FROM dividend_config ORDER BY ticker")
+            divs = cur.fetchall()
+
+        embed = discord.Embed(title="💰 Dividend Schedule", color=discord.Color.green())
+        embed.description = "Quarterly dividend payouts (every 90 days)"
+
+        for ticker, yield_pct in divs:
+            embed.add_field(name=ticker, value=f"{yield_pct*100:.1f}% yield", inline=True)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @bot.event
+    async def on_ready():
             try:
                 if GUILD_ID:
                     guild_obj = discord.Object(id=GUILD_ID)
