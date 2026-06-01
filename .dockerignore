@@ -1,5 +1,11 @@
+.venv
+venv
+env
 __pycache__
 .git
 .env.local
 *.pyc
 .DS_Store
+.pytest_cache
+.vscode
+*.log
