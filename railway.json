@@ -1,0 +1,16 @@
+{
+  "build": {
+    "builder": "dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "startCommand": "python bot.py",
+    "restartPolicyMaxRetries": 5,
+    "volumes": [
+      {
+        "name": "market_data",
+        "mountPath": "/data"
+      }
+    ]
+  }
+}

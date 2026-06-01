@@ -221,9 +221,34 @@ def init_db():
             ticker TEXT PRIMARY KEY,
             dividend_yield REAL NOT NULL DEFAULT 0.02
         );
+        CREATE TABLE IF NOT EXISTS deposit_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT NOT NULL,
+            game_name TEXT NOT NULL,
+            gross_amount INTEGER NOT NULL,
+            fee_amount INTEGER NOT NULL,
+            credited_amount INTEGER NOT NULL,
+            tx_id TEXT,
+            timestamp REAL NOT NULL,
+            FOREIGN KEY (discord_id) REFERENCES users(discord_id)
+        );
+        CREATE TABLE IF NOT EXISTS withdrawal_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT NOT NULL,
+            game_name TEXT NOT NULL,
+            requested_amount INTEGER NOT NULL,
+            fee_amount INTEGER NOT NULL,
+            sent_amount INTEGER NOT NULL,
+            status TEXT DEFAULT 'PENDING',
+            withdrawal_id INTEGER,
+            timestamp REAL NOT NULL,
+            FOREIGN KEY (discord_id) REFERENCES users(discord_id)
+        );
         CREATE INDEX IF NOT EXISTS idx_achievements_discord ON achievements(discord_id);
         CREATE INDEX IF NOT EXISTS idx_dividends_discord ON dividends_paid(discord_id);
         CREATE INDEX IF NOT EXISTS idx_market_events_time ON market_events(event_time);
+        CREATE INDEX IF NOT EXISTS idx_deposit_ledger_time ON deposit_ledger(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_withdrawal_ledger_time ON withdrawal_ledger(timestamp);
     """
     with get_conn() as conn:
         conn.executescript(sql)
@@ -637,21 +662,34 @@ class MarketEvents:
             # Apply price impact to affected tickers
             for ticker in event["tickers"]:
                 cur = conn.execute(
-                    "SELECT gold_pool, share_pool FROM tickers WHERE ticker = ?",
+                    "SELECT gold_pool, share_pool, day_start_price FROM tickers WHERE ticker = ?",
                     (ticker,)
                 )
                 row = cur.fetchone()
                 if not row:
                     continue
                 
-                gold_pool, share_pool = row
+                gold_pool, share_pool, day_start_price = row
                 impact_multiplier = Decimal(1) + Decimal(event["impact"])
                 new_gold_pool = int(Decimal(gold_pool) * impact_multiplier)
                 
-                conn.execute(
-                    "UPDATE tickers SET gold_pool = ?, last_updated = CURRENT_TIMESTAMP WHERE ticker = ?",
-                    (new_gold_pool, ticker)
-                )
+                # Check circuit breaker before applying the price change
+                old_price = Decimal(gold_pool) / Decimal(share_pool) if share_pool else Decimal(0)
+                new_price = Decimal(new_gold_pool) / Decimal(share_pool) if share_pool else Decimal(0)
+                change = abs((new_price - old_price) / old_price) if old_price > 0 else Decimal(0)
+                
+                if change > CIRCUIT_BREAKER_HARD:
+                    # Circuit breaker triggered — freeze the ticker instead of applying the event
+                    conn.execute(
+                        "UPDATE tickers SET is_frozen = 1, last_updated = CURRENT_TIMESTAMP WHERE ticker = ?",
+                        (ticker,)
+                    )
+                    logger.info(f"Market event {event['name']} on {ticker} would breach circuit breaker — ticker frozen instead")
+                else:
+                    conn.execute(
+                        "UPDATE tickers SET gold_pool = ?, last_updated = CURRENT_TIMESTAMP WHERE ticker = ?",
+                        (new_gold_pool, ticker)
+                    )
             
             conn.commit()
             logger.info(f"Market event: {event['name']} - Impact: {event['impact']*100:+.1f}%")
@@ -843,12 +881,33 @@ def process_rows_in_db(rows):
                     # Auto-complete the withdrawal
                     withdrawal_id, _ = withdrawal_row
                     conn.execute("UPDATE withdrawals SET status = 'COMPLETED' WHERE withdrawal_id = ?", (withdrawal_id,))
+                    # Record the transaction in verifications to prevent reprocessing
+                    conn.execute(
+                        "INSERT OR IGNORE INTO verifications(tx_id, discord_id, game_name, nonce, raw_payload, verified_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (tx_id, user_row[0], sender, "WITHDRAWAL_COMPLETION", json.dumps(e), datetime.now(datetime.timezone.utc).isoformat())
+                    )
                     completed_withdrawals.append((user_row[0], sender, amount, withdrawal_id))
                     conn.commit()
                     continue
                 # Regular deposit (no matching withdrawal)
+                # Apply 2% fee on deposit
+                fee_amount = int(Decimal(amount) * Decimal("0.02"))
+                credited_amount = amount - fee_amount
                 conn.execute("UPDATE users SET internal_gold = internal_gold + ? WHERE discord_id = ?",
-                             (amount, user_row[0]))
+                             (credited_amount, user_row[0]))
+                # Log the deposit with fee breakdown
+                conn.execute(
+                    "INSERT INTO deposit_ledger (discord_id, game_name, gross_amount, fee_amount, credited_amount, tx_id, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user_row[0], sender, amount, fee_amount, credited_amount, tx_id, datetime.now().timestamp())
+                )
+                # Record in verifications to prevent reprocessing
+                conn.execute(
+                    "INSERT OR IGNORE INTO verifications(tx_id, discord_id, game_name, nonce, raw_payload, verified_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (tx_id, user_row[0], sender, "DEPOSIT_PROCESSED", json.dumps(e), datetime.now(datetime.timezone.utc).isoformat())
+                )
                 conn.commit()
                 continue
             # Attempt to match a pending verification
@@ -1477,6 +1536,31 @@ else:
             await interaction.response.send_message("No account found. Use `/link` to get started.", ephemeral=True)
         elif result == "not_verified":
             await interaction.response.send_message("Your account is not verified. Use `/link` first.", ephemeral=True)
+        elif result.startswith("ok:"):
+            # Extract game_name from result format "ok:game_name"
+            game_name = result.split(":", 1)[1]
+            # Calculate fee and log withdrawal
+            fee_amount = int(Decimal(amount) * Decimal("0.02"))
+            sent_amount = amount - fee_amount
+            
+            def _log_withdrawal(did, gname, req_amt, fee_amt, sent_amt):
+                with get_conn() as conn:
+                    # Get the withdrawal_id that was just created
+                    cur = conn.execute(
+                        "SELECT withdrawal_id FROM withdrawals WHERE discord_id = ? AND amount = ? AND status = 'PENDING' ORDER BY requested_at DESC LIMIT 1",
+                        (did, req_amt)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        wid = row[0]
+                        conn.execute(
+                            "INSERT INTO withdrawal_ledger (discord_id, game_name, requested_amount, fee_amount, sent_amount, status, withdrawal_id, timestamp) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (did, gname, req_amt, fee_amt, sent_amt, 'PENDING', wid, datetime.now().timestamp())
+                        )
+                        conn.commit()
+            
+            await asyncio.to_thread(_log_withdrawal, discord_id, game_name, amount, fee_amount, sent_amount)
         elif result.startswith("insufficient_gold"):
             current = result.split(":")[1]
             await interaction.response.send_message(
@@ -1485,10 +1569,13 @@ else:
             )
         else:
             game_name = result.split(":", 1)[1]
+            # Calculate the 2% fee
+            fee_amount = int(Decimal(amount) * Decimal("0.02"))
+            sent_amount = amount - fee_amount
             await interaction.response.send_message(
                 f"Withdrawal of **{amount:,} gold** to **{game_name}** submitted.\n"
-                f"An admin will process it and send the gold in-game. "
-                f"Processing times may vary.",
+                f"After 2% fee: **{sent_amount:,} gold** will be sent in-game.\n"
+                f"An admin will process it. Processing times may vary.",
                 ephemeral=True
             )
             log_ch = bot.get_channel(WITHDRAWAL_LOG_CHANNEL_ID)
@@ -1975,9 +2062,15 @@ else:
             await interaction.response.send_message("No pending withdrawals.", ephemeral=True)
             return
         total = sum(r[2] for r in rows)
-        lines = [f"**Pending withdrawals ({len(rows)}) — {total:,} gold total**", ""]
+        # Calculate total after fees
+        total_after_fees = sum(int(Decimal(r[2]) * Decimal("0.98")) for r in rows)
+        total_fees = total - total_after_fees
+        lines = [f"**Pending withdrawals ({len(rows)}) — {total:,} gold requested**", 
+                 f"After 2% fees: {total_after_fees:,} gold to send (fees: {total_fees:,})", ""]
         for wid, name, amt, req_at in rows:
-            lines.append(f"  `#{wid}` — **{name}** — {amt:,} gold — {req_at[:16]}")
+            fee = int(Decimal(amt) * Decimal("0.02"))
+            to_send = amt - fee
+            lines.append(f"  `#{wid}` — **{name}** — Request: {amt:,} | Send: {to_send:,} (fee: {fee}) — {req_at[:16]}")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @bot.tree.command(name="admin_complete_withdrawal", description="[Admin] Mark a withdrawal as completed")
@@ -1996,6 +2089,8 @@ else:
                 if not row:
                     return None
                 conn.execute("UPDATE withdrawals SET status = 'COMPLETED' WHERE withdrawal_id = ?", (wid,))
+                # Update withdrawal_ledger to mark as COMPLETED
+                conn.execute("UPDATE withdrawal_ledger SET status = 'COMPLETED' WHERE withdrawal_id = ?", (wid,))
                 conn.execute("INSERT INTO audit_logs(actor, action, details) VALUES (?, 'admin_complete_withdrawal', ?)",
                              (str(interaction.user.id), json.dumps({"withdrawal_id": wid})))
                 conn.commit()
@@ -2007,8 +2102,11 @@ else:
             )
         else:
             amt, name = row
+            fee = int(Decimal(amt) * Decimal("0.02"))
+            to_send = amt - fee
             await interaction.response.send_message(
-                f"Withdrawal `#{withdrawal_id}` marked as **COMPLETED** — **{amt:,} gold** to **{name}**."
+                f"Withdrawal `#{withdrawal_id}` marked as **COMPLETED**.\n"
+                f"Player: **{name}** | Requested: {amt:,} | Send: **{to_send:,} gold** (2% fee: {fee})"
             )
 
     @bot.tree.command(name="admin_cancel_withdrawal", description="[Admin] Cancel a pending withdrawal and refund the gold")
@@ -2113,6 +2211,53 @@ else:
             await interaction.response.send_message(
                 f"Order `#{order_id}` cancelled — **{name}**'s {side} of {shares:,} `{tick}` @ {price:.4f}.{refund_note}"
             )
+
+    @bot.tree.command(name="treasury_flow", description="[Admin] View treasury profit from deposits and withdrawals")
+    async def treasury_flow(interaction: discord.Interaction):
+        if not _check_admin(interaction):
+            await interaction.response.send_message("This command is restricted to admin.", ephemeral=True)
+            return
+        def _calc_profit():
+            with get_conn() as conn:
+                # Calculate total deposit fees
+                deposit_result = conn.execute(
+                    "SELECT COUNT(*) as count, COALESCE(SUM(gross_amount), 0) as total_gross, COALESCE(SUM(fee_amount), 0) as total_fee "
+                    "FROM deposit_ledger"
+                ).fetchone()
+                deposit_count, deposit_gross, deposit_fees = deposit_result
+                
+                # Calculate total withdrawal fees
+                withdrawal_result = conn.execute(
+                    "SELECT COUNT(*) as count, COALESCE(SUM(requested_amount), 0) as total_requested, COALESCE(SUM(fee_amount), 0) as total_fee "
+                    "FROM withdrawal_ledger"
+                ).fetchone()
+                withdrawal_count, withdrawal_requested, withdrawal_fees = withdrawal_result
+                
+                total_profit = deposit_fees + withdrawal_fees
+                return {
+                    "deposits": {"count": deposit_count, "gross": deposit_gross, "fees": deposit_fees},
+                    "withdrawals": {"count": withdrawal_count, "requested": withdrawal_requested, "fees": withdrawal_fees},
+                    "total_profit": total_profit
+                }
+        
+        data = await asyncio.to_thread(_calc_profit)
+        
+        lines = [
+            "**TREASURY FLOW REPORT**",
+            "",
+            f"**DEPOSITS (All Time)**",
+            f"  Transactions: {data['deposits']['count']:,}",
+            f"  Gross Gold: {data['deposits']['gross']:,}",
+            f"  2% Fees Collected: {data['deposits']['fees']:,}",
+            "",
+            f"**WITHDRAWALS (All Time)**",
+            f"  Transactions: {data['withdrawals']['count']:,}",
+            f"  Gold Requested: {data['withdrawals']['requested']:,}",
+            f"  2% Fees Collected: {data['withdrawals']['fees']:,}",
+            "",
+            f"**TOTAL PROFIT: {data['total_profit']:,} GOLD**"
+        ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=False)
 
     # ---- Market embed helpers ----
 
@@ -2288,14 +2433,35 @@ async def background_market_events():
 
 
 async def background_dividend_payouts():
-    """Pay dividends every 90 days (quarterly)."""
+    """Pay dividends every 90 days (quarterly), with persistent tracking across restarts."""
     await bot.wait_until_ready()
+    logger.info("Dividend payout task started (checks every hour)")
+    
     while True:
-        # Sleep for 90 days
-        await asyncio.sleep(90 * 24 * 3600)
         try:
-            total = await asyncio.to_thread(Dividends.payout_dividends)
-            if WITHDRAWAL_LOG_CHANNEL_ID and total > 0:
+            def _check_and_pay():
+                with get_conn() as conn:
+                    # Get last payout timestamp from persistent store
+                    cur = conn.execute("SELECT value FROM ledger_state WHERE key = 'last_dividend_payout'")
+                    row = cur.fetchone()
+                    last_payout = int(row[0]) if row and row[0] else 0
+                    now = int(datetime.now(datetime.timezone.utc).timestamp())
+                    
+                    # Check if 90 days (7776000 seconds) have passed
+                    DIVIDEND_INTERVAL = 90 * 24 * 3600  # 90 days in seconds
+                    if now - last_payout >= DIVIDEND_INTERVAL:
+                        total = Dividends.payout_dividends()
+                        conn.execute(
+                            "INSERT OR REPLACE INTO ledger_state(key, value) VALUES ('last_dividend_payout', ?)",
+                            (str(now),)
+                        )
+                        conn.commit()
+                        logger.info(f"Quarterly dividend payout completed. Total paid: {total} gold")
+                        return total
+                    return 0
+            
+            total = await asyncio.to_thread(_check_and_pay)
+            if total > 0 and WITHDRAWAL_LOG_CHANNEL_ID:
                 try:
                     ch = bot.get_channel(WITHDRAWAL_LOG_CHANNEL_ID)
                     if ch:
@@ -2303,7 +2469,10 @@ async def background_dividend_payouts():
                 except Exception:
                     logger.exception("Failed to post dividend summary to channel")
         except Exception:
-            logger.exception("Dividend payout failed")
+            logger.exception("Dividend payout check failed")
+        
+        # Check every hour instead of sleeping 90 days straight
+        await asyncio.sleep(3600)
 
 async def background_price_drift():
     """Randomly walk every non-frozen ticker's price every PRICE_DRIFT_INTERVAL seconds."""
