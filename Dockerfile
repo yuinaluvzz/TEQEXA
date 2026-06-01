@@ -9,6 +9,4 @@ RUN mkdir -p /app/data
 COPY bot.py .
 COPY mock_ledger ./mock_ledger
 
-VOLUME ["/app/data"]
-
 CMD ["python", "bot.py"]
