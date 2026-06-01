@@ -7,6 +7,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/data
 
 COPY bot.py .
-COPY mock_ledger ./mock_ledger
 
 CMD ["python", "bot.py"]
