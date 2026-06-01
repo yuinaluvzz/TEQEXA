@@ -97,6 +97,9 @@ logger = logging.getLogger(__name__)
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level="EXCLUSIVE")
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")  # Write-Ahead Logging for better concurrency
+    conn.execute("PRAGMA synchronous = NORMAL")  # Balance safety/speed
+    conn.execute("PRAGMA cache_size = 10000")  # Increase cache for faster queries
     try:
         yield conn
     finally:
@@ -251,6 +254,10 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_withdrawal_ledger_time ON withdrawal_ledger(timestamp);
     """
     with get_conn() as conn:
+        # Enable performance optimizations for <200 players
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA cache_size = 10000")
         conn.executescript(sql)
         # seed tickers if missing — (ticker, gold_pool, share_pool) → price = gold_pool/share_pool
         TICKER_SEED = [
