@@ -10,4 +10,6 @@ COPY main_code/ ./main_code/
 
 RUN mkdir -p /app/data
 
+ENV PYTHONPATH=/app/main_code:$PYTHONPATH
+
 CMD ["python", "bot.py"]
