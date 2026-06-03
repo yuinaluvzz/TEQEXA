@@ -2,7 +2,7 @@ import asyncio
 import logging
 import discord
 from discord.ext import commands
-from logging_config import configure_logging
+from main_code.infra.logging_config import configure_logging
 from database import init_db
 from config import DISCORD_TOKEN
 import discord_commands
